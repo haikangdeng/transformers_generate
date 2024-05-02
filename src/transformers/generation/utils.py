@@ -1229,8 +1229,8 @@ class GenerationMixin:
         streamer: Optional["BaseStreamer"] = None,
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
-        start_noise_idx: Optional[int] = None,
-        end_noise_idx: Optional[int] = None,
+        # start_noise_idx: Optional[int] = None,
+        # end_noise_idx: Optional[int] = None,
         noise_scale: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
@@ -1533,8 +1533,8 @@ class GenerationMixin:
                 return_dict_in_generate=generation_config.return_dict_in_generate,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
-                start_noise_idx=start_noise_idx,
-                end_noise_idx=end_noise_idx,
+                # start_noise_idx=start_noise_idx,
+                # end_noise_idx=end_noise_idx,
                 noise_scale=noise_scale,
                 **model_kwargs,
             )
@@ -2250,8 +2250,8 @@ class GenerationMixin:
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: bool = False,
         streamer: Optional["BaseStreamer"] = None,
-        start_noise_idx: Optional[int] = None,
-        end_noise_idx: Optional[int] = None,
+        # start_noise_idx: Optional[int] = None,
+        # end_noise_idx: Optional[int] = None,
         noise_scale: Optional[torch.Tensor] = None,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
@@ -2395,7 +2395,24 @@ class GenerationMixin:
         # keep track of which sequences are already finished
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
-        this_peer_finished = False  # used by synced_gpus only        
+        this_peer_finished = False  # used by synced_gpus only       
+        
+        if noise_scale is not None:
+            embed_tokens = self.model.get_input_embeddings()
+            inputs_embeds = embed_tokens(input_ids)
+            inputs_embeds_norm = inputs_embeds.norm(dim=-1)                                         # [b, l]
+            raw_noise = torch.randn_like(inputs_embeds)                                             # [b, l, hidden_size]
+
+            noise_scale = noise_scale.to(input_ids.device)                                          # [b, l]
+            noise_multiplier = (noise_scale * inputs_embeds_norm / (inputs_embeds.shape[-1])**0.5)  # [b, l]
+            noise_tensor = noise_multiplier.unsqueeze(-1) * raw_noise                               # [b, l, hidden_size]
+            
+            inputs_embeds += noise_tensor
+            initial_stage = True
+            
+            # print(f'*** inputs_embeds_norm: {inputs_embeds_norm}')
+            # print(f'*** noise_tensor: {noise_tensor.norm(dim=-1)}')
+         
         while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
@@ -2407,49 +2424,24 @@ class GenerationMixin:
                 if this_peer_finished_flag.item() == 0.0:
                     break
 
-            # prepare model inputs
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-
-            # get model embedding layer
-            embed_tokens = self.model.get_input_embeddings()
-            
-            # Add noise when model_inputs are longer than the designated noise range
-            #   - input_ids increments by 1 each iteration, (e.g. [b, 170] => [b, 171])
-            #   - model_inputs has constant size (e.g. [b,1]) for every timestep t > 1
-            if start_noise_idx and end_noise_idx and model_inputs["input_ids"].shape[1] >= end_noise_idx:
-                inputs_embeds = embed_tokens(model_inputs["input_ids"])
-                
-                # 1. create mask to mask out noise on timesteps other than user inputs
-                noise_mask = torch.zeros_like(inputs_embeds).to(input_ids.device)
-                noise_mask[:, start_noise_idx:end_noise_idx] = 1
-                
-                # 2. create noise with the same norm as inputs_embeds
-                original_inputs_embeds_norm = inputs_embeds.norm(dim=-1)                    # [b, l]
-                raw_noise = torch.randn_like(inputs_embeds)                                 # [b, l, hidden_size]
-                noise = raw_noise * (original_inputs_embeds_norm / (inputs_embeds.shape[-1])**0.5).unsqueeze(-1)
-                
-                # 3. apply noise to inputs_embeds
-                #   - new input x = (1 - a) * x + a * y
-                noise_scale = noise_scale.unsqueeze(-1)
-                inputs_embeds = (1-noise_scale)*inputs_embeds + noise_scale * (noise_mask*noise + (1-noise_mask)*inputs_embeds)
-                
-                # 4. rescale to original inputs_embeds size
-                current_inputs_embeds_norm = inputs_embeds.norm(dim=-1)                     # [b, l]
-                normalizing_factor = (original_inputs_embeds_norm / current_inputs_embeds_norm).unsqueeze(-1)
-                inputs_embeds *= normalizing_factor
-                
-                # remove the input_ids key as we want to use inputs_embeds instead
-                model_inputs.pop("input_ids")
+            if noise_scale is not None:
+                if initial_stage:
+                    model_inputs = self.prepare_inputs_for_generation(input_ids, inputs_embeds=inputs_embeds, **model_kwargs)
+                    initial_stage = False
+                else:
+                    model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+                    
+                # print(f'*** model_inputs: {model_inputs["input_ids"] if "input_ids" in model_inputs else model_inputs}')
                 
                 # forward pass to get next token
                 outputs = self(
                     **model_inputs,
-                    inputs_embeds=inputs_embeds,
                     return_dict=True,
                     output_attentions=output_attentions,
                     output_hidden_states=output_hidden_states,
                 )
             else:
+                model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
                 outputs = self(
                     **model_inputs,
                     return_dict=True,
